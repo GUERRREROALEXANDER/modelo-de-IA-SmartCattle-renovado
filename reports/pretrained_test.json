@@ -1,0 +1,118 @@
+[
+  {
+    "precision": 0.8702009217901188,
+    "recall": 0.5921052631578947,
+    "mAP50": 0.651537791058451,
+    "mAP50-95": 0.5348637963354756,
+    "operating_conf": 0.35,
+    "operating": {
+      "TP": 83,
+      "FP": 6,
+      "FN": 69,
+      "precision": 0.9325842696629213,
+      "recall": 0.5460526315789473,
+      "false_positives_on_negative_images": 0,
+      "mean_absolute_count_error": 0.7127659574468085
+    },
+    "weights": "yolov8n.pt",
+    "split": "test",
+    "images": 94,
+    "conf": 0.001,
+    "iou": 0.6,
+    "imgsz": 640,
+    "class_names": [
+      "cow"
+    ],
+    "model_class_ids": [
+      19
+    ],
+    "mean_inference_ms_per_image": 52.31319787305844
+  },
+  {
+    "precision": 0.8390840489524145,
+    "recall": 0.5832064492416303,
+    "mAP50": 0.6254166823422429,
+    "mAP50-95": 0.5232580123155807,
+    "operating_conf": 0.35,
+    "operating": {
+      "TP": 83,
+      "FP": 5,
+      "FN": 69,
+      "precision": 0.9431818181818182,
+      "recall": 0.5460526315789473,
+      "false_positives_on_negative_images": 0,
+      "mean_absolute_count_error": 0.7446808510638298
+    },
+    "weights": "yolo11n.pt",
+    "split": "test",
+    "images": 94,
+    "conf": 0.001,
+    "iou": 0.6,
+    "imgsz": 640,
+    "class_names": [
+      "cow"
+    ],
+    "model_class_ids": [
+      19
+    ],
+    "mean_inference_ms_per_image": 49.00606702102913
+  },
+  {
+    "precision": 0.9363850793214457,
+    "recall": 0.6118421052631579,
+    "mAP50": 0.6566790836995982,
+    "mAP50-95": 0.5761695191292794,
+    "operating_conf": 0.35,
+    "operating": {
+      "TP": 93,
+      "FP": 6,
+      "FN": 59,
+      "precision": 0.9393939393939394,
+      "recall": 0.6118421052631579,
+      "false_positives_on_negative_images": 0,
+      "mean_absolute_count_error": 0.6063829787234043
+    },
+    "weights": "yolo11s.pt",
+    "split": "test",
+    "images": 94,
+    "conf": 0.001,
+    "iou": 0.6,
+    "imgsz": 640,
+    "class_names": [
+      "cow"
+    ],
+    "model_class_ids": [
+      19
+    ],
+    "mean_inference_ms_per_image": 140.82405319145727
+  },
+  {
+    "precision": 0.8826164166101552,
+    "recall": 0.5789473684210527,
+    "mAP50": 0.6066336457981429,
+    "mAP50-95": 0.5059770318722789,
+    "operating_conf": 0.35,
+    "operating": {
+      "TP": 79,
+      "FP": 7,
+      "FN": 73,
+      "precision": 0.9186046511627907,
+      "recall": 0.5197368421052632,
+      "false_positives_on_negative_images": 0,
+      "mean_absolute_count_error": 0.7446808510638298
+    },
+    "weights": "yolo26n.pt",
+    "split": "test",
+    "images": 94,
+    "conf": 0.001,
+    "iou": 0.6,
+    "imgsz": 640,
+    "class_names": [
+      "cow"
+    ],
+    "model_class_ids": [
+      19
+    ],
+    "mean_inference_ms_per_image": 65.66793829846033
+  }
+]
