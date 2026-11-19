@@ -1,0 +1,67 @@
+"""Validated detection settings."""
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _default_device() -> str:
+    import torch
+
+    return "0" if torch.cuda.is_available() else "cpu"
+
+
+#: Classes the detector may report. Cattle and people are the default; the others are
+#: COCO animals that matter on a farm (a loose dog near the herd, a horse, sheep, a
+#: predator) and that the fine-tuned model still recognizes, because it kept the COCO head.
+ALLOWED_CLASSES = ("cow", "person", "dog", "horse", "sheep", "bear")
+
+DEFAULT_WEIGHTS = Path(__file__).resolve().parents[1] / "models" / "cattle_coco_yolo11n_best.pt"
+
+
+def _default_weights() -> str:
+    # Fine-tuned cow+person model; pretrained COCO weights if it has not been trained yet.
+    return str(DEFAULT_WEIGHTS) if DEFAULT_WEIGHTS.is_file() else "yolo11n.pt"
+
+
+@dataclass(frozen=True)
+class Settings:
+    weights: str = field(default_factory=_default_weights)
+    confidence: float = 0.35
+    iou: float = 0.5
+    imgsz: int = 640
+    class_names: tuple[str, ...] = ("cow", "person")
+    device: str = field(default_factory=_default_device)
+    person_weights: str = "yolo11n.pt"
+    # Detections this weak are never trusted alone, but one on top of an animal already being followed is that animal.
+    weak_confidence: float = 0.15
+
+    def __post_init__(self) -> None:
+        if not 0 < self.confidence <= 1:
+            raise ValueError("confidence must be greater than 0 and at most 1")
+        if not 0 < self.weak_confidence <= 1:
+            raise ValueError("weak_confidence must be greater than 0 and at most 1")
+        if not 0 < self.iou <= 1:
+            raise ValueError("iou must be greater than 0 and at most 1")
+        if self.imgsz < 32 or self.imgsz % 32:
+            raise ValueError("imgsz must be a multiple of 32 and at least 32")
+        if not self.class_names or any(not name.strip() for name in self.class_names):
+            raise ValueError("class_names must contain at least one nonempty name")
+        if any(name not in ALLOWED_CLASSES for name in self.class_names):
+            raise ValueError("class_names may contain only " + ", ".join(ALLOWED_CLASSES))
+        if not self.person_weights.strip():
+            raise ValueError("person_weights must be nonempty")
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        classes = os.getenv("SMARTCATTLE_CLASSES", "cow,person")
+        return cls(
+            weights=os.getenv("SMARTCATTLE_WEIGHTS", _default_weights()),
+            confidence=float(os.getenv("SMARTCATTLE_CONF", "0.35")),
+            iou=float(os.getenv("SMARTCATTLE_IOU", "0.5")),
+            imgsz=int(os.getenv("SMARTCATTLE_IMGSZ", "640")),
+            class_names=tuple(name.strip() for name in classes.split(",")),
+            device=os.getenv("SMARTCATTLE_DEVICE", _default_device()),
+            person_weights=os.getenv("SMARTCATTLE_PERSON_WEIGHTS", "yolo11n.pt"),
+            weak_confidence=float(os.getenv("SMARTCATTLE_WEAK_CONF", "0.15")),
+        )
