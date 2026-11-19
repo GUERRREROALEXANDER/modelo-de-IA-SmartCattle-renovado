@@ -1,0 +1,603 @@
+# SmartCattle AI
+
+SmartCattle AI detects **cows and persons** in images and videos with YOLO and OpenCV. The default model is `models/cattle_coco_yolo11n_best.pt`: pretrained COCO YOLO11n fine-tuned on a cleaned Open Images cattle dataset. It keeps the 80-class COCO head, so cow (class 19) and person (class 0) come from one model in one prediction per frame. Other classes are filtered out. An optional normalized safe-zone rule can send events for cows outside the zone to the SmartCattle FastAPI backend. Persons never create events.
+
+```text
+video -> OpenCV frames -> YOLO -> detections -> annotated boxes / optional events
+```
+
+## Current status
+
+| Item | Value |
+|---|---|
+| Default model | `models/cattle_coco_yolo11n_best.pt` (copy of `runs/cattle/yolo11n_coco_finetune/weights/best.pt`) |
+| Base model | `yolo11n.pt` (COCO pretrained) |
+| Output classes | `cow`, `person` |
+| Training | 25-epoch schedule, best epoch 16, CPU, config `configs/train_cattle_coco.yaml` |
+| Test result, cow | mAP50 0.690, mAP50-95 0.549 (pretrained: 0.625, 0.523) |
+| Test result, person | mAP50 0.524, mAP50-95 0.295 (pretrained: 0.486, 0.300) |
+| Inference input | Image files, image folders, video files |
+
+Details and sources for every number are in [Model and training](#model-and-training) and [Evaluation](#evaluation).
+
+## Project structure
+
+```text
+.
+├── detect.py                          # Image, folder, video, and backend CLI.
+├── live.py                            # Live camera (Imou, RTSP, phone, webcam) + YOLO + backend.
+├── video_worker.py                    # Processes the videos uploaded in the dashboard.
+├── probe_camera.py                    # Checks that a camera or phone stream reaches this PC.
+├── smartcattle_ai/
+│   ├── __init__.py                    # Exports Detector and Settings.
+│   ├── config.py                      # Validated inference settings and environment defaults.
+│   ├── detector.py                    # Cow/person model routing and detection records.
+│   ├── model_loader.py                # Ultralytics loader and class-ID helper.
+│   ├── media.py                       # OpenCV reading, annotation, and output.
+│   ├── rules.py                       # Safe-zone rule based on box bottom center.
+│   ├── zones.py                       # Safe zones: rectangles, polygons, several per camera.
+│   ├── tracking.py                    # IoU tracker: one number per animal across frames.
+│   ├── stillness.py                   # Notices a tracked cow that has not moved for a long time.
+│   ├── line_counter.py                # Counts tracked cattle crossing a gate line.
+│   ├── night_watch.py                 # Night window and once-per-person announcements.
+│   ├── heatmap.py                     # Grid of where the cattle stand, painted over a frame.
+│   ├── pipeline.py                    # Rule-event publishing, once per escape.
+│   ├── live.py                        # Live service workers: detection, status, head count, zones.
+│   ├── video_jobs.py                  # Uploaded-video worker: claim, download, analyze, report.
+│   ├── stream.py                      # Reconnecting capture; phone and webcam sources.
+│   ├── backend_client.py              # HTTP client, payload conversion, and cooldown.
+│   ├── evaluation.py                  # Cattle matching and metrics.
+│   └── camera.py                      # Stream-reading helper, separate from detect.py.
+├── scripts/
+│   ├── build_dataset.py               # Build the one-class Open Images YOLO dataset.
+│   ├── build_coco_variant.py          # Build the COCO-indexed cow+person dataset variant.
+│   ├── validate_dataset.py            # Check labels, images, and split leakage.
+│   ├── train.py                       # Fine-tune YOLO, resume, and write reports.
+│   ├── evaluate.py                    # Compare checkpoints per class on a YOLO split.
+│   ├── scenario_report.py             # Predictions on licensed scenario images.
+│   ├── video_report.py                # Compare checkpoints on videos with contact sheets.
+│   └── export_onnx.py                 # Export to ONNX and time it against PyTorch.
+├── configs/
+│   ├── train_cattle_coco.yaml         # Settings of the default model.
+│   └── train_cattle.yaml              # Single-class experiment settings.
+├── data/
+│   ├── ATTRIBUTION.csv                # Per-image authors, licenses, and source links.
+│   ├── label_review.csv               # Manual exclusions and reasons.
+│   ├── dataset_stats.json             # Dataset selection and final split counts.
+│   ├── samples/manifest.csv           # Scenario descriptions, counts, and credits.
+│   ├── samples/labels/                # Scenario ground-truth boxes where present.
+│   ├── samples/*.jpg                  # Scenario images.
+│   └── raw/                           # Downloaded Open Images files and videos.
+├── datasets/cattle_coco/data.yaml     # Generated COCO-indexed dataset (training data).
+├── datasets/cattle/data.yaml          # Generated one-class dataset.
+├── reports/                           # Metrics, scenario and video reports (see Evaluation).
+├── models/README.md                   # Checkpoint paths and regeneration notes.
+├── runs/cattle/                       # Generated training records and checkpoints.
+├── outputs/                           # Annotated media.
+├── tests/                             # pytest suite (see Tests).
+├── requirements.txt                   # Python dependencies.
+└── pytest.ini                         # Test discovery and real marker.
+```
+
+`datasets/`, `data/raw/`, `runs/`, `outputs/`, and `*.pt` are ignored by Git, so the trained model must be kept or regenerated locally. The scenario images, labels, manifest, and attribution metadata are repository data.
+
+## Requirements and installation
+
+Use Python 3.13 on Windows with PowerShell. `requirements.txt` lists Ultralytics, OpenCV, NumPy, and pytest; PyTorch comes through Ultralytics' dependencies. Everything runs on CPU; the recorded training and timings used CPU.
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+The first use of pretrained weights may download them. If HTTPS certificate validation fails, Ultralytics can fall back to `curl` for its weight download. The dataset downloader also tries the system certificate store, `certifi` when installed, and then `curl.exe`.
+
+## Running inference
+
+Run from the repository root. No `--weights` flag is needed: the CLI loads `models/cattle_coco_yolo11n_best.pt` when it exists and prints the model it uses.
+
+```powershell
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg
+python detect.py --source data/samples
+python detect.py --source data/raw/videos/Herding_the_cows_video.webm --vid-stride 2
+```
+
+The folder command processes supported images directly inside that folder. `--vid-stride 2` processes every second video frame. Other examples:
+
+```powershell
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg --json
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg --no-save
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg --classes cow --conf 0.5
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg --weights yolo11n.pt
+```
+
+`--json` prints an object for one source or a list for a folder. `--no-save` disables annotated output. `--classes` accepts `cow`, `person`, or a comma-separated pair. The default confidence threshold is `0.35`. Other controls include `--weights`, `--iou`, `--imgsz`, `--device`, `--output-dir`, and video-only `--max-frames`. By default, annotated images go to `outputs/<source-stem>_annotated.<extension>` and videos to `outputs/<source-stem>_annotated.mp4`. Cow boxes are drawn in green and person boxes in orange, each labeled with its confidence.
+
+Real output of the default model on a scenario image (two cows lying on grass):
+
+```text
+Model: D:\Escritorio\modelo de ia yolo\models\cattle_coco_yolo11n_best.pt
+File: data\samples\224ad16181d9fb6b.jpg
+Cattle: 2; Persons: 0
+cow  conf=0.94 bbox=[500.4, 246.1, 921.7, 420.3]
+cow  conf=0.91 bbox=[126.3, 295.0, 617.5, 524.9]
+```
+
+And on a video:
+
+```text
+Model: D:\Escritorio\modelo de ia yolo\models\cattle_coco_yolo11n_best.pt
+File: data\raw\videos\Herding_the_cows_video.webm
+Frames: 198 (read: 396)
+Cattle: 2101; Persons: 173
+Max cattle: 18; max persons: 4; average cattle: 10.61
+Annotated video: outputs\default_check\Herding_the_cows_video_annotated.mp4
+```
+
+Video `Cattle` and `Persons` sum detections across processed frames; they are not counts of unique animals or people.
+
+## Output format
+
+This JSON example uses the synthetic 64 × 64 image and fake detection from `tests/test_cli.py`; it illustrates field names and types, not model performance:
+
+```json
+{
+  "source": "<test-directory>/cow.jpg",
+  "width": 64,
+  "height": 64,
+  "total_cattle": 1,
+  "total_persons": 0,
+  "detections": [{"class": "cow", "confidence": 0.91, "bbox": [1, 2, 30, 40]}],
+  "output": null
+}
+```
+
+`bbox` contains pixel-space `[x1, y1, x2, y2]`; confidence is rounded to four decimals and coordinates to one. `output` is `null` with `--no-save`. Video JSON also has `frames_read`, `frames_processed`, `fps`, `max_cattle`, `max_persons`, `avg_cattle`, `frames_with_cattle`, and a `frames` array with per-frame detections. The `Model:` line is printed only without `--json`, so JSON output stays parseable.
+
+## Model and training
+
+### Why fine-tune
+
+The [pretrained scenario report](reports/scenarios_pretrained_yolo11n.md) shows pretrained YOLO11n missing small, distant, occluded, and low-light cows. A first experiment replaced the head with a single `cow` class (`configs/train_cattle.yaml`); it scored below the pretrained model on the test split (mAP50 0.546, mAP50-95 0.335, 33 false positives; `reports/singleclass_experiment_test.json`) and lost person detection. The default model instead keeps the COCO head and fine-tunes with a low learning rate and a frozen backbone, so pretrained cow and person knowledge is adjusted, not relearned.
+
+### Training configuration
+
+`configs/train_cattle_coco.yaml`: base `yolo11n.pt`, dataset `datasets/cattle_coco/data.yaml`, 25 epochs, patience 8, image size 640, batch 8, CPU, 4 workers, seed 0, deterministic, AdamW, `lr0` 0.0005, 1 warmup epoch, `warmup_bias_lr` 0, `freeze` 10 (backbone layers), `close_mosaic` 5.
+
+The run was interrupted after epoch 9 and resumed from `last.pt` with `--resume`. `reports/yolo11n_coco_finetune.json` records 24 epoch rows and the best epoch, 16; the resumed segment took 1276 s (about 21 min) on an Intel Core i5-1235U (12 logical cores, 15.71 GiB RAM, PyTorch `2.14.0+cpu`, no CUDA). Per-epoch curves are in `reports/training/yolo11n_coco_finetune/`.
+
+```powershell
+python scripts/build_dataset.py
+python scripts/build_coco_variant.py
+python scripts/validate_dataset.py --data datasets/cattle_coco/data.yaml --out reports/dataset_coco_validation.json
+python scripts/train.py --config configs/train_cattle_coco.yaml --weights-out models/cattle_coco_yolo11n_best.pt
+```
+
+`train.py` keeps the best checkpoint at `runs/cattle/yolo11n_coco_finetune/weights/best.pt`, copies it to `--weights-out`, validates it on the test split, and writes `reports/<run-name>.json`. `--weights-out` defaults to `models/cattle_yolo11n_best.pt` (the single-class experiment path), so pass it explicitly for the default model.
+
+### Resuming an interrupted run
+
+```powershell
+python scripts/train.py --config configs/train_cattle_coco.yaml --resume --weights-out models/cattle_coco_yolo11n_best.pt
+```
+
+`--resume` loads `runs/cattle/<name>/weights/last.pt` of the run named in the config and continues with the settings stored in that checkpoint (epochs, learning rate, freeze); CLI overrides such as `--epochs` do not apply. It fails with a clear message if no `last.pt` exists. After training it writes the same weights copy and report as a fresh run.
+
+### Validation metrics (Ultralytics)
+
+Best epoch on the validation split (46 images), from the training log and `reports/yolo11n_coco_finetune.json`:
+
+| Class | Images | Instances | P | R | mAP50 | mAP50-95 |
+|---|---:|---:|---:|---:|---:|---:|
+| all | 46 | 118 | 0.664 | 0.549 | 0.574 | 0.407 |
+| cow | 39 | 93 | 0.845 | 0.538 | 0.663 | 0.492 |
+| person | 8 | 25 | 0.483 | 0.560 | 0.485 | 0.322 |
+
+Ultralytics test validation after training (94 images): all 0.769 P, 0.546 R, 0.596 mAP50, 0.426 mAP50-95; cow 0.689 mAP50, 0.564 mAP50-95; person 0.504 mAP50, 0.288 mAP50-95. For the comparison with the pretrained model, use the table below, which evaluates both models with the same script and settings.
+
+## Dataset
+
+`scripts/build_dataset.py` maps Open Images V7 **Cattle** and **Bull** boxes to `cow`. The Open Images `validation` split becomes the held-out `test` split; its `test` split is shuffled with seed 42 and divided approximately 85%/15% into `train`/`val`. Background-class images without selected cattle labels supply negatives with empty label files; the builder samples roughly 12% negatives relative to the positive selection before later exclusions.
+
+`scripts/build_coco_variant.py` builds `datasets/cattle_coco` from the same 404 images and local metadata, writing cows as COCO class 19 and Open Images person-type boxes as COCO class 0. Its `data.yaml` lists all 80 COCO names so the pretrained head stays aligned. Label counts per split, counted from the label files (`reports/dataset_coco_validation.json` reports valid, no errors, warnings, or duplicates):
+
+| Split | Images | Positive | Negative | Cow boxes | Person boxes |
+|---|---:|---:|---:|---:|---:|
+| Train | 264 | 232 | 32 | 454 | 520 |
+| Validation | 46 | 40 | 6 | 93 | 25 |
+| Test | 94 | 84 | 10 | 152 | 153 |
+| **Total** | **404** | **356** | **48** | **699** | **698** |
+
+Ultralytics reports 149 cow instances in the test split while the label files contain 152; `scripts/evaluate.py` uses all 152.
+
+Source `IsGroupOf` and `IsDepiction` images are excluded, as are invalid or very small boxes and rotated images whose boxes would disagree with downloaded image orientation. Manual review removes other species, ambiguous cases, artwork, and one non-exhaustive herd label. `data/label_review.csv` contains **135** exclusions:
+
+| Reason | Count | Reason | Count |
+|---|---:|---|---:|
+| Water buffalo | 29 | Bison | 20 |
+| African/Cape buffalo | 19 | Goat | 16 |
+| Yak | 14 | Sheep | 13 |
+| Antelope/deer/wild ungulate | 10 | Ambiguous species | 6 |
+| Gaur | 4 | Depiction (art/illustration) | 3 |
+| Single box covers a herd | 1 | **Total** | **135** |
+
+`data/dataset_stats.json` records 36 group, 7 depiction, and 0 rotated exclusions from source validation; 80 group, 25 depiction, and 2 rotated exclusions from source test. All 404 rows of `data/ATTRIBUTION.csv` identify an image author, title, CC BY 2.0 license, original URL, and landing URL. Open Images annotations are CC BY 4.0. The builder accepts `--limit` for a smaller debug build and `--workers` for download concurrency.
+
+## Evaluation
+
+### Test split: pretrained vs fine-tuned
+
+`scripts/evaluate.py` collects predictions at confidence `0.001` with model NMS IoU `0.6`, then reports maximum-F1 precision/recall, mAP50, and mAP50-95 per class. TP, FP, FN, false positives on negative images, and mean absolute count error use the operating confidence `0.35` and matching IoU 0.50. Results from `reports/coco_finetune_comparison.json` (94 test images, 152 cows, 153 persons):
+
+| Class | Weights | P | R | mAP50 | mAP50-95 | TP | FP | FN | FP on negatives | Count MAE |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cow | `yolo11n.pt` | 0.839 | 0.583 | 0.625 | 0.523 | 83 | 5 | 69 | 0 | 0.745 |
+| cow | **fine-tuned** | **0.942** | **0.643** | **0.690** | **0.549** | **99** | 7 | **53** | 1 | **0.553** |
+| person | `yolo11n.pt` | 0.515 | 0.556 | 0.486 | 0.300 | 85 | 79 | 68 | 21 | 0.968 |
+| person | **fine-tuned** | 0.665 | 0.484 | 0.524 | 0.295 | 62 | **21** | 91 | 7 | 0.979 |
+
+Mean inference: 66.5 ms/image (`yolo11n.pt`) and 61.0 ms/image (fine-tuned) on the CPU above.
+
+For cows, fine-tuning finds 16 more animals at the operating point and lowers count error. For persons, it cuts false positives from 79 to 21 but misses more people. Among cow-only pretrained baselines in `reports/pretrained_test.json`, the larger `yolo11s.pt` reaches mAP50-95 0.576 (mAP50 0.657) at 140.8 ms/image.
+
+```powershell
+python scripts/evaluate.py --weights yolo11n.pt --weights models/cattle_coco_yolo11n_best.pt --data datasets/cattle_coco/data.yaml --split test --classes cow,person --out reports/coco_finetune_comparison.json
+```
+
+### Scenario images
+
+The 16 images in `data/samples/manifest.csv` cover close-up, grouped, distant, occluded, breed, low-light, and two negative scenarios with expected cattle counts. Full tables: [pretrained](reports/scenarios_pretrained_yolo11n.md), [fine-tuned](reports/scenarios_coco_finetune.md); annotated images in `outputs/scenarios/cattle_coco_yolo11n_best/`.
+
+| | `yolo11n.pt` | Fine-tuned |
+|---|---:|---:|
+| Expected cows | 36 | 36 |
+| Missed | 14 | 14 |
+| False positives | 2 | 3 |
+| Detections on the 2 negative images | 0 | 0 |
+
+| Scenario | `yolo11n.pt` (detected / missed) | Fine-tuned (detected / missed) |
+|---|---|---|
+| Night rodeo, motion blur (1) | 0 / 1 | 1 / 0 |
+| Holstein behind bars (3) | 1 / 2 | 3 / 0 |
+| Dairy barn behind railings (2) | 3 / 0, 1 FP | 2 / 0 |
+| Dark rodeo pen (2) | 1 / 1 | 2 / 1, 1 FP |
+| Tiny distant cows on a hillside (3) | 2 / 1 | 1 / 2 |
+| Small close overlapping group (3) | 3 / 0 | 3 / 2, 2 FP (misplaced boxes) |
+| Dense overlapping herd (8) | 3 / 5 | 3 / 5 |
+| Watusi, Highland breeds (2 each) | 1 / 1 each | 1 / 1 each |
+
+The fine-tuned model improves on occlusion and low light and loses on very small distant cows and tightly overlapping groups.
+
+```powershell
+python scripts/scenario_report.py --weights models/cattle_coco_yolo11n_best.pt --out reports/scenarios_coco_finetune.md
+```
+
+### Videos
+
+From [`reports/video_report_coco_finetune.md`](reports/video_report_coco_finetune.md), stride 2. The videos have no labels, so these are detection statistics, not accuracy:
+
+| Video | Weights | Frames | Max cows | Avg cows | Max persons | Avg persons | Frames with cows | ms/frame |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Herding the cows | `yolo11n.pt` | 198 | 22 | 11.44 | 4 | 1.08 | 193 | 113.9 |
+| Herding the cows | fine-tuned | 198 | 18 | 10.61 | 4 | 0.87 | 198 | 99.2 |
+| Moving cows | `yolo11n.pt` | 418 | 13 | 7.63 | 3 | 0.94 | 398 | 97.9 |
+| Moving cows | fine-tuned | 418 | 13 | 7.01 | 2 | 0.76 | 404 | 98.5 |
+
+The fine-tuned model keeps cows in view in more frames but counts slightly fewer per frame. Contact sheets of annotated frames are in `reports/video_frames/`.
+
+```powershell
+python scripts/video_report.py --videos data/raw/videos/Herding_the_cows_video.webm --videos "data/raw/videos/Moving_cows_to_the_summer_range__42877666722_.webm" --weights yolo11n.pt --weights models/cattle_coco_yolo11n_best.pt --out reports/video_report_coco_finetune.md
+```
+
+Evaluation videos are downloaded to `data/raw/videos/` and are not committed:
+
+- [“Herding the cows video”](https://commons.wikimedia.org/wiki/File:Herding_the_cows_video.webm) by Marie Nouvellon, CC BY 2.0.
+- [“Moving cows to the summer range”](https://commons.wikimedia.org/wiki/File:Moving_cows_to_the_summer_range_(42877666722).webm) by BLM Oregon & Washington, public domain.
+
+## Backend integration
+
+Set the API key **only through the environment**. With `--backend-url` or `SMARTCATTLE_BACKEND_URL`, the CLI first requires `GET /health` to return `{"status":"ok"}`. The safe zone is normalized `left,top,right,bottom` and defaults to `0.1,0.1,0.9,0.9`; a cow is outside when its box's bottom center falls outside it. Boundaries count as inside.
+
+```powershell
+$env:SMARTCATTLE_API_KEY = "<your-api-key>"
+python detect.py --source data/samples/0dfb0cb56b5f6f83.jpg --backend-url http://127.0.0.1:8000 --camera-id camera-01 --zone 0.1,0.1,0.9,0.9
+python detect.py --source data/raw/videos/Herding_the_cows_video.webm --backend-url http://127.0.0.1:8000 --camera-id camera-01 --zone 0.1,0.1,0.9,0.9 --event-cooldown 10 --vid-stride 2
+```
+
+Outside-zone cows create `POST /api/ai/events` requests with `Content-Type: application/json` and, when set, `X-API-Key`. The backend must return HTTP 201. Payload shape (the confidence comes from the backend test fixture; the timestamp is supplied at runtime):
+
+```json
+{
+  "event_type": "cattle_out_of_zone",
+  "camera_id": "camera-01",
+  "detected_object": "cow",
+  "confidence": 0.91,
+  "timestamp": "<UTC ISO 8601 timestamp>"
+}
+```
+
+For videos, `--event-cooldown` defaults to 10 seconds per camera ID, measured in video time; at most one event is attempted during each cooldown interval. Images and folders use zero cooldown. A failed POST logs a warning and processing continues, but that attempt consumes the cooldown. Events contain neither bounding boxes nor person detections. The CLI prints `Backend events sent: <count>`.
+
+`live.py` is stricter about what it reports, because the backend turns these events into WhatsApp messages:
+
+- An animal must stay outside for `--escape-confirm-seconds` (3 by default) before it is reported, so one wrong box does not reach a phone. It may go unseen for up to 5 seconds while being confirmed.
+- Events leave on their own thread. A slow or absent backend never holds up detection: they wait in a queue of up to 200 and are retried for up to 15 minutes, keeping the time they were detected. Stopping the service loses what is still queued.
+- WhatsApp is not this service's concern. It only talks to the backend, so a WhatsApp failure cannot affect monitoring.
+
+### Cameras from the camera manager
+
+To run detection on whatever the camera manager (`whatsapp-SmartCattle/camara`) publishes in MediaMTX, give this service its key. Each camera it lists starts under the same ID within 15 seconds, and stops when it is removed there. Cameras added from the dashboard are left alone, and an unreachable manager removes nothing.
+
+```
+SMARTCATTLE_GESTOR_KEY=<CAMERA_API_KEY of the camera manager>
+# SMARTCATTLE_GESTOR_URL=http://127.0.0.1:8095
+```
+
+For alerts to reach someone, a camera's `camara_id` must be the ID the backend gave it when it was saved: a camera nobody owns notifies nobody.
+
+## Configuration
+
+`smartcattle_ai/config.py` reads the inference variables below; `detect.py` reads the backend variables. CLI flags override matching settings.
+
+| Environment variable | Default | Meaning / CLI flag |
+|---|---|---|
+| `SMARTCATTLE_WEIGHTS` | `models/cattle_coco_yolo11n_best.pt` if present, else `yolo11n.pt` | Primary model; `--weights`. |
+| `SMARTCATTLE_PERSON_WEIGHTS` | `yolo11n.pt` | Loaded only if the primary model lacks `person`; no flag. |
+| `SMARTCATTLE_CONF` | `0.35` | Inference confidence; `--conf`. |
+| `SMARTCATTLE_IOU` | `0.5` | Inference NMS IoU; `--iou`. |
+| `SMARTCATTLE_IMGSZ` | `640` | Input size; `--imgsz`. |
+| `SMARTCATTLE_CLASSES` | `cow,person` | Output classes; `--classes`. Also allowed: `dog`, `horse`, `sheep`, `bear` (see Other animals). |
+| `SMARTCATTLE_WEAK_CONF` | `0.15` | Weakest detection kept when it lies on an animal already followed. |
+| `SMARTCATTLE_DEVICE` | CUDA `0` if available, else `cpu` | Inference device; `--device`. |
+| `SMARTCATTLE_BACKEND_URL` | Unset | Enables publishing; `--backend-url`. |
+| `SMARTCATTLE_API_KEY` | Unset | Event `X-API-Key`; environment only. |
+| `SMARTCATTLE_CAMERA_ID` | `camera-01` | Event camera ID; `--camera-id`. |
+| `SMARTCATTLE_ZONE` | `0.1,0.1,0.9,0.9` | Normalized safe zone; `--zone`. |
+
+If `models/cattle_coco_yolo11n_best.pt` is missing (for example on a fresh clone, since weights are not committed), inference falls back to pretrained `yolo11n.pt`; the `Model:` line shows which one is in use. `--event-cooldown` defaults to 10 seconds and has no environment variable. Settings permit only `cow`, `person`, `dog`, `horse`, `sheep` and `bear`, require confidence and IoU in `(0, 1]`, and require `imgsz` to be at least 32 and divisible by 32.
+
+## Tests
+
+```powershell
+python -m pytest -q
+python -m pytest -q -m real
+```
+
+The first command runs the whole suite (256 tests), **including** tests marked `real`; the second selects only those. The real tests load YOLO and infer on an Ultralytics sample and, when available, local cattle samples. Other tests cover configuration and default-model selection, class routing, image/video processing, stride, zone boundaries, CLI behavior, a local test backend and its contract, event cooldown, tracking, stillness, gate counting, other farm animals, people at night, the heat map, the ONNX export, polygon and multiple zones, head counts, zone reloading, phone and webcam sources, the uploaded-video worker, dataset validation, and metric calculations.
+
+## Limitations
+
+- A cow's posture was measured on labelled photographs and on walking herds, but never on real night footage. See "What each cow is doing".
+
+- **Small dataset.** 404 images, 94 in test. Results do not establish performance on other farms, cameras, weather, or lighting, and nothing has been measured on the target farm's camera yet.
+- **Recall.** At confidence 0.35 the model still misses 53 of 152 test cows (recall 0.651) and 91 of 153 test persons (recall 0.405).
+- **Distant and crowded cows.** Very small distant cows and tightly overlapping herds are the weakest scenarios; the fine-tuned model is worse than pretrained on tiny distant cows.
+- **Unusual breeds.** Watusi and Highland cattle are each detected only 1 of 2 times.
+- **Simple tracking.** `tracking.py` matches boxes by overlap from one frame to the next. It keeps an animal's number while it walks, but two cows crossing each other can swap numbers, and one hidden for longer than about a second (live: 15 processed frames) comes back as a new animal. `detect.py` totals still count the same animal in every frame.
+- **CPU speed.** About 60–100 ms per frame at 640 px on the recorded CPU, so a live stream needs frame skipping (`--vid-stride`).
+- **Inputs.** `detect.py` requires an existing file or folder; the live camera goes through `live.py` instead.
+
+## Live camera
+
+`live.py` starts with no camera and loads no model until someone connects a camera from the Cameras page of the dashboard. `--url` opens one at start, and `--auto-camera` opens the one in `.env` and reconnects the saved list. For each camera it runs the detector on the newest frame only (about 10 FPS on CPU), and serves on `http://localhost:8090`:
+
+| Path | Content |
+| --- | --- |
+| `/video.mjpg` | MJPEG video with boxes and the safe zone drawn in; cows outside the zone are red. |
+| `/status` | Camera state, frame size, FPS and the latest detections (pixel boxes, `inside_zone`). |
+| `/snapshot.jpg` | Latest annotated frame. |
+| `/heatmap.jpg` | Latest frame with a heat map of where the cattle have stood since the service started (404 with `--no-heatmap`). |
+| `/health` | `{"status":"ok"}` |
+
+With `SMARTCATTLE_BACKEND_URL` set it also:
+
+- reports the camera status every 15 s (`PUT /api/ai/cameras/{id}/status`);
+- sends the head count, cattle inside and outside with their boxes, every second (`PUT /api/ai/cameras/{id}/occupancy`, `--occupancy-interval`). The backend shows it on the live dashboard and keeps one sample per minute for the history reports;
+- loads the safe zones drawn in the dashboard (`GET /api/ai/cameras/{id}/zones`) and reloads them every 30 s (`--zone-sync-interval`), so a new or edited zone applies without a restart. Polygons are honored, and with several zones an animal is safe in any of them. When the camera has no active zone, `--zone` / `SMARTCATTLE_ZONE` applies; when the backend cannot be reached, the zone in use stays;
+- posts an out-of-zone event **once per escape**: each cow gets a number (`track_id`) that follows it from frame to frame, and it is reported when it leaves the zone, not on every frame it stays out. It can be reported again after being seen back inside. `--event-cooldown` still spaces events per camera, so a whole herd walking out becomes a trickle of alerts. `--no-tracking` returns to one event per cooldown.
+
+**A cow that stops moving.** A tracked cow whose center stays within 2 % of the frame for 30 minutes (`--still-after-minutes`, `0` turns it off) may be down, sick or calving. It is drawn in magenta with `STILL <minutes>m`, carries `still: true` and `still_for_s` in `/status`, and the console warns once per still period. Walking restarts the clock, while a tracker that loses a resting cow does not: the number it comes back with inherits the clock if it reappears in the same spot within 15 minutes. It needs tracking, so `--no-tracking` turns it off too.
+
+**A cow down.** Cattle rest around half the day, so lying or holding still is not an alarm. Lying without moving for 4 hours (`--down-after-minutes`, `0` turns it off) sends a `cattle_down` event once per resting period, which the backend turns into a high alert. The 4 hours are a starting point, not a veterinary rule. It needs the backend's `feat/anomaly-alerts` or later, which knows the type.
+
+**Counting through a gate.** `--gate-line x1,y1,x2,y2` (or `SMARTCATTLE_GATE_LINE`), in fractions of the frame, draws a yellow line, for example across a gate or a corridor, and counts each tracked cow that walks across it, once per crossing. A cow that walks around the end of the line is not counted. Which way is "in" depends on the order of the two points: for a line drawn top to bottom (`0.5,0,0.5,1`), walking from the right half of the image to the left half is "in". Swap the two points to reverse it. The totals are drawn on the video, returned as `gate` in `/status` and printed in the console. They start at zero when the service starts and are not sent to the backend. The counter needs tracking.
+
+```powershell
+python live.py --url 192.168.1.20:8080 --camera-id celular-01 --port 8091 --gate-line 0.5,0,0.5,1
+```
+
+**Other animals.** The fine-tuned model kept the 80-class COCO head, so it still recognizes dogs (16), horses (17), sheep (18) and bears (21) in the same prediction, at no extra cost. They are off by default; turn them on with `SMARTCATTLE_CLASSES=cow,person,dog,horse`. They are drawn in cyan and counted apart on the video, and they are never counted as cattle, checked against the zone or sent to the backend's head count. A dog or a bear, which can scatter or attack the herd, is announced once per animal in the console and sent as `external_animal_detected`. They stay off by default because a farm's own dog would raise alerts all day. These classes were not part of the fine-tuning data, so their accuracy is COCO's, not measured on farm footage.
+
+**People at night.** With `--night-window 20:00-05:30` (or `SMARTCATTLE_NIGHT_WINDOW`), a person seen inside that local window is drawn in red with `NIGHT`, carries `night: true` in `/status`, is announced once in the console and is sent as `possible_intrusion`: at that hour nobody is expected among the animals. The window may cross midnight and is read in `--timezone` (`SMARTCATTLE_TIMEZONE`, `America/Bogota` by default), so it works the same on a PC in Colombia and on a server in UTC. The window is 20:00-05:30 unless set; an empty `SMARTCATTLE_NIGHT_WINDOW` turns it off. It needs tracking.
+
+**Heat map.** Every frame drops the ground point of each cow into a 32×18 grid. `/heatmap.jpg` paints it over the latest frame (blue: seldom, red: most of the time), which shows where the herd gathers: shade, water, a corner of the pen. It counts sightings, not distinct animals, starts empty on every start, and `/status` reports how many positions it holds as `heatmap_samples`. `--no-heatmap` turns it off.
+
+A backend that is down does not stop the video. `/status` also returns `zones` (every zone with its outline) and `zone_source` (`backend` or `config`). `/status` allows CORS only from `SMARTCATTLE_LIVE_ORIGINS` (default: local Vite ports). It listens on `127.0.0.1` unless `--host 0.0.0.0` is given.
+
+```powershell
+python probe_camera.py --duration 10 --reconnect-test   # check the stream first
+python live.py                                          # waits for a camera from the dashboard
+python live.py --url 1                                  # opens webcam 1 right away
+powershell -ExecutionPolicy Bypass -File scripts\start_local.ps1   # backend, live.py and frontend together
+```
+
+`python live.py --tunnel` (or `SMARTCATTLE_LIVE_TUNNEL=1`) also starts a Cloudflare quick tunnel (`cloudflared` on PATH, in `%LOCALAPPDATA%\cloudflared\`, or `SMARTCATTLE_CLOUDFLARED`) and reports its `https://*.trycloudflare.com` URL to the backend as the camera's `stream_url`, so a hosted frontend finds the video without a rebuild. The URL changes on every start, and anyone who has it can watch the camera. `--public-url` reports a fixed URL instead.
+
+The frontend uses the camera's `stream_url` from the backend and falls back to `VITE_AI_SERVICE_URL` (default setup: `http://localhost:8090`). Over RTSP the service has to run on a PC that shares the camera's network. Test the model on footage from this camera before relying on its counts.
+
+### Phone camera, webcam, and more than one camera
+
+`--url` (or `CAMERA_URL` in `.env`) accepts any of these:
+
+| What you have | Value | Example |
+| --- | --- | --- |
+| A phone app that shows an IP address, such as **IP Webcam** (Android) | the address the app shows | `--url 192.168.1.20:8080` (read as `http://192.168.1.20:8080/video`) |
+| **DroidCam** over Wi-Fi | address and path | `--url 192.168.1.20:4747/video` |
+| An app that gives a full link (RTSP or HTTP) | the link | `--url rtsp://192.168.1.20:8554/live` |
+| A webcam, or a phone turned into one by the **DroidCam** or **Iriun** PC client | its index | `--url 0` (built-in webcam), `--url 1` (the next one) |
+
+The phone and the PC must be on the same Wi-Fi network, and the app must stay open with the screen on. Check the stream before running YOLO:
+
+```powershell
+python probe_camera.py --url 192.168.1.20:8080
+python live.py --url 192.168.1.20:8080 --camera-id celular-01 --port 8091
+```
+
+**Each camera is one `live.py`**, with its own `--camera-id` and `--port`. The Imou camera can keep running on 8090 while the phone runs on 8091. The `camera-id` is how the backend tells cameras apart: it is the name zones are drawn for in the dashboard, and it may contain letters, digits, `-` and `_` (up to 64). Each process loads its own copy of the model, about 10 FPS per camera on a CPU.
+
+```powershell
+python live.py                                                         # Imou camera, camera-01, port 8090
+python live.py --url 192.168.1.20:8080 --camera-id celular-01 --port 8091   # phone, in a second window
+```
+
+A phone on the farm network is reachable only from a PC on that network, so its `live.py` runs on that PC, not on Render. Use `--tunnel` to show its video in a hosted frontend.
+
+### Adding cameras from the dashboard
+
+The **Connect a camera** form on the Cameras page adds a camera next to the ones already running. `live.py` opens it from the farm PC, so a backend in the cloud never needs to reach a private address. All cameras share one process, one model and one port, so they take turns on the CPU, and a PC runs at most 8 added cameras.
+
+| Request | Effect |
+| --- | --- |
+| `POST /cameras` | `{"host": "192.168.1.50", "password": "...", "username": "...", "path": "/live"}` or `{"url": "rtsp://..."}`. Answers `202` with `camera_id` and `stream_url` (`<service>/cameras/<id>`) |
+| `GET /cameras/<id>/status`, `/video.mjpg`, `/snapshot.jpg`, `/heatmap.jpg` | The same as the service's own paths, for that camera |
+| `DELETE /cameras/<id>` | Stops the camera and forgets it |
+
+The saved password of `CAMERA_HOST` is used only for that host; any other address must bring its own. The list and its passwords are kept in `.cameras.json` on this PC (`SMARTCATTLE_CAMERAS_FILE`, ignored by git), so added cameras return after a restart. The backend's database gets the address without credentials (`PUT /api/ai/cameras/{id}/source`), never the password.
+
+**Who may change cameras.** On a PC or a LAN, `POST`, `DELETE` and `/cameras/scan` answer only the origins in `SMARTCATTLE_LIVE_ORIGINS`. With `--tunnel` or a public `--public-url`, `Origin` proves nothing, so they also need a signed-in dashboard session, which `live.py` checks against the backend (`GET /api/auth/me`). Without `SMARTCATTLE_BACKEND_URL` they are refused. The video itself has no login in any of these setups.
+
+**Where each deployment can reach.** `live.py` opens the camera itself, so it only reaches what its own machine reaches:
+
+| `live.py` runs on | Cameras it can add |
+| --- | --- |
+| A PC in the camera's network, optionally with `--tunnel` | Private addresses (`192.168.x.x`), webcams, public addresses |
+| Render (`SMARTCATTLE_CLOUD=1`) | Public addresses only, such as a router's forwarded port. Private addresses get a clear error |
+
+On Render the disk is erased on each deploy, so `.cameras.json` does not survive one: added cameras must be added again unless the service has a persistent disk (`SMARTCATTLE_CAMERAS_FILE=/var/data/cameras.json`).
+
+### Using it from anywhere
+
+The dashboard and the backend live on the internet, and each farm has one PC running this service, because only something on the farm's network can open its cameras. The PC opens a tunnel outwards, so no router needs configuring and no one needs to be on the farm's wifi to watch.
+
+1. On the farm's PC, unzip this repository and double click `Iniciar SmartCattle.bat`. It installs what is missing; the first time takes several minutes.
+2. Sign in on the dashboard, open **Cameras** and press **Mostrar código**. Type the code into the PC's window. This happens once.
+3. From then on the Cameras page searches and connects through that PC, wherever you open it from. The PC restarts the service if it stops, starts with Windows, and brings the tunnel back if it drops, reporting the new address to the backend.
+
+Each PC gets its own key, valid only for the cameras of its account. If the PC is off or has no internet, the page says so.
+
+The quick tunnel is free and needs no account, but Cloudflare gives no uptime guarantee for it, so it fits a few people rather than a commercial service.
+
+### Installing it at a farm
+
+The system works with the cameras of whoever installs it, on their own network:
+
+1. Copy the three repositories to the farm's PC, without this PC's `.env` or `.cameras.json`: those hold another site's camera.
+2. Fill in `.env` from `.env.example`. No camera setting is needed.
+3. Run `scripts\start_local.ps1`. It opens the Cameras page.
+4. Create an account: it starts empty, and it is theirs.
+5. On the Cameras page, search the network or scan the QR with a phone, save the camera and press Connect.
+
+The PC must be on the same network as the cameras, because the AI service is what opens them.
+
+### Opening the dashboard from another device
+
+Same Wi-Fi: run the three services on every interface, and open `http://<this PC's IP>:5173`.
+
+```powershell
+python live.py --host 0.0.0.0                          # reports http://<this PC's IP>:8090 and allows that origin
+uvicorn app.main:app --host 0.0.0.0 --port 8000        # backend; add http://<this PC's IP>:5173 to ALLOWED_ORIGINS
+npm run dev -- --host 0.0.0.0 --port 5173              # frontend
+```
+
+Anyone on that network can then watch `/video.mjpg`, because the video has no login. From another network, use the hosted frontend with `--tunnel`.
+
+### What each cow is doing
+
+Every camera estimates whether each cow is `walking`, `standing` or `lying`, sends it with its box to the dashboard, where the 3D view shows it, and every 30 seconds sends the counts to the backend for the daily report. The detector only knows "cow", so `smartcattle_ai/posture.py` adds the rest:
+
+- **Walking:** the middle of the box moves at least 0.15 body lengths per second.
+- **Lying or standing:** a small classifier (`models/cattle_posture_cls.pt`, about 15 ms per animal on CPU) looks at each animal every two seconds, and the most common of its last five sure answers decides. Lying also requires having held the spot for five seconds.
+- **Without the classifier, or while it is unsure:** the box's shape decides: at least twice as wide as tall, or falling to 72 % of its recent height with the feet in the same place.
+- A change must hold for two seconds. An animal cut off by the edge of the picture with no answer yet has no posture, and is counted as unknown.
+
+What it measures, in `reports/posture_evaluation.json`: five folds over 351 labelled animals (128 lying), with every picture wholly on one side.
+
+| Finding cows lying | Found (recall) | Right when it says lying (precision) |
+|---|---|---|
+| Box shape alone, by day | 31 % | 83 % |
+| Whole rule, by day | 89 % | 89 % |
+| Whole rule, simulated night | 83 % | 89 % |
+
+Those rows are the 254 animals (49 lying) of the Open Images set. The other 97 were searched for as resting cattle, and score higher (99 % by day) partly because of that, so they are left out of the table. On two real videos of herds on the move, about 12,000 observations, none was called lying; the classifier alone had called about one in ten so, walking cows with hidden or blurred legs, which is why lying requires stillness. Those videos contain no resting cows, so they say nothing about finding them.
+
+The limits of those numbers: the labels were set by eye by an AI assistant, not a veterinarian. **No real night footage has been measured**: "simulated night" is a day picture made grey, dim and noisy, and a real infrared camera may do worse. Check it on your own camera before relying on it.
+
+Frames in the dark also lose cows: on the test images the detector finds 65 % of them by day and 53 % on simulated night. Brightening the frames (CLAHE, gamma) did not help, so the service does not do it. What it does is keep a weak detection (confidence from 0.15, `SMARTCATTLE_WEAK_CONF`) when it lies on an animal already followed: on simulated night the two test videos then see 25-37 % more cows per frame and hand out 7-22 % fewer numbers, with the count jumping about as much.
+
+To retrain, with the pictures of `data/posture_labels.csv` in `datasets/` (credits in `data/posture_commons_credits.csv`): `python scripts/train_posture.py`, then `python scripts/evaluate_posture_monitor.py`.
+
+### Training on real standing and lying cattle
+
+Better accuracy takes pictures of the herd labelled by a person. A model whose classes are `cow_standing` and `cow_lying` replaces the estimate with no code change:
+
+```powershell
+python scripts/collect_posture_frames.py --source 1 --every 5     # sorts pictures by estimated posture
+# Check every picture, label the boxes in YOLO format, and write datasets/cattle_posture/data.yaml
+python scripts/validate_dataset.py --data datasets/cattle_posture/data.yaml --allowed-classes 0,1
+python scripts/train.py --config configs/train_cattle_posture.yaml --weights-out models/cattle_posture_best.pt
+```
+
+Then set `SMARTCATTLE_WEIGHTS=models/cattle_posture_best.pt`. No such model has been trained yet: it needs those pictures. The separate classifier described above needs no change to the detector.
+
+### Cloud deployment (Imou Open Platform)
+
+With `IMOU_APP_ID`, `IMOU_APP_SECRET` and `IMOU_DEVICE_ID` set, `live.py` skips RTSP and asks the Imou cloud for the camera's HLS live URL (`bindDeviceLive` the first time, then `getLiveStreamInfo` on every reconnect), so it can run anywhere with internet access. The camera must be added to the Imou developer account that owns the app (open.imoulife.com). HLS adds a few seconds of delay compared with RTSP.
+
+`render.yaml` deploys the `Dockerfile` as a Render web service: in Render choose **New > Blueprint**, select this repository and fill in the variables marked as secret. The service listens on Render's `PORT` and reports `RENDER_EXTERNAL_URL` to the backend as the camera's `stream_url`. It uses the `starter` plan because free instances sleep after 15 minutes without visitors and are too slow for the detector. `SMARTCATTLE_IMGSZ=416` trades some accuracy for speed on that CPU.
+
+## Faster CPU inference with ONNX
+
+`scripts/export_onnx.py` exports the model to ONNX, which ONNX Runtime runs faster on a CPU than PyTorch does. It needs the optional packages in `requirements-onnx.txt`.
+
+```powershell
+pip install -r requirements-onnx.txt
+python scripts/export_onnx.py --benchmark                 # outputs/onnx/cattle_coco_yolo11n_best_640.onnx
+$env:SMARTCATTLE_WEIGHTS = "outputs/onnx/cattle_coco_yolo11n_best_640.onnx"
+python live.py                                            # same detector, ONNX weights
+```
+
+Measured on the development PC's CPU, at 640 px, mean of 20 predictions on a sample image:
+
+| Weights | ms/frame | Speedup |
+| --- | ---: | ---: |
+| `cattle_coco_yolo11n_best.pt` | 58.0 | 1.00× |
+| `cattle_coco_yolo11n_best_640.onnx` | 43.4 | 1.34× |
+
+The ONNX file has a fixed input size: export it with the same `--imgsz` you run it with (`SMARTCATTLE_IMGSZ`, 416 on Render). It keeps the class names, so cow, person and the other animals are routed the same way. The export goes to `outputs/`, which Git ignores; the Docker image still ships the `.pt` model.
+
+## Uploaded videos
+
+`video_worker.py` processes the videos people upload in the dashboard. It waits on the backend's queue (`POST /api/ai/video-jobs/claim`, every 5 s when it is empty), downloads each video from storage, and runs the same detector, tracker and safe-zone rule as the live camera over it. The zones are those of the lot's camera, or `--zone` when the lot has none.
+
+```powershell
+$env:SMARTCATTLE_API_KEY = "<the backend AI_API_KEY>"
+python video_worker.py --backend-url https://<backend>.onrender.com
+python video_worker.py --backend-url http://127.0.0.1:8000 --once   # one video, then exit
+```
+
+Every 2 s it sends progress with the current frame's boxes (`PUT .../progress`), which renews the job's ten-minute lease and lets the dashboard draw the boxes over the playback. At the end it delivers the summary (`POST .../complete`):
+
+| Field | Meaning |
+| --- | --- |
+| `frames_analyzed` | Frames run through the model: one of every `--vid-stride` (default 2) |
+| `max_cattle`, `max_people` | Most seen in a single frame |
+| `alerts` | One per cow escape (when it leaves the zone) and one per person who appears, with the second of the video; at most 500 |
+| `outside_ratio` | Share of cattle sightings that were outside the zone |
+| `avg_confidence` | Mean confidence over all detections |
+
+A file that cannot be downloaded or decoded is marked failed (`POST .../fail`) with a reason people can read. If another worker took the job over (its lease expired), this one drops it without reporting. The backend needs `VIDEO_STORAGE_*` configured; without it the queue answers 503 and the worker keeps waiting. The downloaded copy is deleted after each job.
+
+## Credits and licenses
+
+[Ultralytics YOLO](https://github.com/ultralytics/ultralytics) is distributed under AGPL-3.0; review its obligations before deployment or redistribution. Open Images V7 images here are CC BY 2.0, with per-image author and source links in [`data/ATTRIBUTION.csv`](data/ATTRIBUTION.csv); Open Images annotations are CC BY 4.0. Scenario image credits are in [`data/samples/manifest.csv`](data/samples/manifest.csv) and the scenario reports. Video credits appear in the evaluation section.
